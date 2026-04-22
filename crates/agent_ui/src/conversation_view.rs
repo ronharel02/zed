@@ -28,10 +28,10 @@ use fs::Fs;
 use futures::FutureExt as _;
 use gpui::{
     Action, Animation, AnimationExt, App, ClickEvent, ClipboardItem, CursorStyle, ElementId, Empty,
-    Entity, EventEmitter, FocusHandle, Focusable, Hsla, ListOffset, ListState, ObjectFit,
-    PlatformDisplay, ScrollHandle, SharedString, StyledText, Subscription, Task, TextRun,
-    TextStyle, WeakEntity, Window, WindowHandle, div, ease_in_out, img, linear_color_stop,
-    linear_gradient, list, pulsating_between,
+    Entity, EventEmitter, FocusHandle, Focusable, Hsla, ListState, ObjectFit, PlatformDisplay,
+    ScrollHandle, SharedString, StyledText, Subscription, Task, TextRun, TextStyle, WeakEntity,
+    Window, WindowHandle, div, ease_in_out, img, linear_color_stop, linear_gradient, list,
+    pulsating_between,
 };
 use language::{Buffer, Language};
 use language_model::{
@@ -10973,8 +10973,8 @@ pub(crate) mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new(first_response.into()),
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+            acp_v1::ContentChunk::new(first_response.into()),
         )]);
 
         let (conversation_view, cx) =
@@ -11000,8 +11000,8 @@ pub(crate) mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new(second_response.into()),
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+            acp_v1::ContentChunk::new(second_response.into()),
         )]);
 
         thread
