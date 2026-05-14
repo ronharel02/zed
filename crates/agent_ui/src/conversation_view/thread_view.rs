@@ -6952,7 +6952,10 @@ impl ThreadView {
             )
             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
             .when_some(copy_response_button, |this, button| this.child(button))
-            .child(scroll_to_recent_user_prompt)
+            .children(
+                (!AgentSettings::get_global(cx).sticky_user_messages)
+                    .then_some(scroll_to_recent_user_prompt),
+            )
             .when_some(scroll_to_top, |this, button| this.child(button))
             .into_any_element()
     }
