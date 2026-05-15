@@ -118,6 +118,58 @@ mod thread_view;
 pub use message_queue::*;
 pub use thread_view::*;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum UserMessageContentSegment {
+    Text(String),
+    Mention { uri: MentionUri, label: String },
+}
+
+pub(crate) fn parse_content_block(
+    block: &acp_v2::ContentBlock,
+    path_style: PathStyle,
+) -> Option<UserMessageContentSegment> {
+    match block {
+        acp_v2::ContentBlock::Text(text_content) => {
+            Some(UserMessageContentSegment::Text(text_content.text.clone()))
+        }
+        acp_v2::ContentBlock::ResourceLink(link) => {
+            Some(match MentionUri::parse(&link.uri, path_style) {
+                Ok(uri) => UserMessageContentSegment::Mention {
+                    label: format!("@{}", uri.name()),
+                    uri,
+                },
+                Err(_) => UserMessageContentSegment::Text(format!("@{}", link.name)),
+            })
+        }
+        acp_v2::ContentBlock::Resource(acp_v2::EmbeddedResource {
+            resource: acp_v2::EmbeddedResourceResource::TextResourceContents(resource),
+            ..
+        }) => Some(match MentionUri::parse(&resource.uri, path_style) {
+            Ok(uri) => UserMessageContentSegment::Mention {
+                label: format!("@{}", uri.name()),
+                uri,
+            },
+            Err(_) => UserMessageContentSegment::Text(resource.uri.clone()),
+        }),
+        acp_v2::ContentBlock::Image(acp_v2::ImageContent { uri, .. }) => {
+            let mention_uri = if let Some(uri) = uri {
+                match MentionUri::parse(uri, path_style) {
+                    Ok(uri) => uri,
+                    Err(_) => return Some(UserMessageContentSegment::Text(uri.clone())),
+                }
+            } else {
+                MentionUri::PastedImage {
+                    name: "Image".to_string(),
+                }
+            };
+            Some(UserMessageContentSegment::Mention {
+                label: format!("@{}", mention_uri.name()),
+                uri: mention_uri,
+            })
+        }
+        _ => None,
+    }
+}
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ThreadFeedback {
     Positive,
