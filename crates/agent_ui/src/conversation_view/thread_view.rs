@@ -58,7 +58,8 @@ use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
 use super::sticky_user_message_preview::{
-    parse_sticky_user_message_preview, render_sticky_user_message_preview,
+    StickyUserMessageSearchHighlights, parse_sticky_user_message_preview,
+    render_sticky_user_message_preview,
 };
 use super::subagent_card::{
     AcpSubagentCard, SubagentCardId, SubagentCardState, SubagentStatus, acp_subagent_card,
@@ -146,6 +147,7 @@ struct ThreadFeedbackState {
 pub(crate) struct StickyUserMessageState {
     pub(crate) message_index: usize,
     message_segments: Vec<UserMessageContentSegment>,
+    search_highlights: Option<StickyUserMessageSearchHighlights>,
     pub(crate) has_more_message_content: bool,
     pub(crate) top_offset: Pixels,
 }
@@ -8584,6 +8586,8 @@ impl ThreadView {
                     }
                 },
             ));
+            self._subscriptions
+                .push(cx.observe(&search_bar, |_, _, cx| cx.notify()));
             self.thread_search_bar = Some(search_bar);
         }
 
@@ -11673,10 +11677,23 @@ impl ThreadView {
 
         let preview =
             parse_sticky_user_message_preview(message.content.source_blocks(), path_style);
+        let search_highlights = self
+            .thread_search_visible
+            .then(|| {
+                self.thread_search_bar.as_ref().and_then(|bar| {
+                    bar.read(cx).sticky_user_message_search_highlights(
+                        message_index,
+                        &preview.segments,
+                        cx,
+                    )
+                })
+            })
+            .flatten();
 
         Some(StickyUserMessageState {
             message_index,
             message_segments: preview.segments,
+            search_highlights,
             has_more_message_content: preview.has_more_message_content,
             top_offset: Self::sticky_user_message_top_offset(push_progress, sticky_header_height),
         })
@@ -11693,6 +11710,7 @@ impl ThreadView {
         let StickyUserMessageState {
             message_index,
             message_segments,
+            search_highlights,
             has_more_message_content,
             top_offset,
         } = state;
@@ -11731,6 +11749,7 @@ impl ThreadView {
         let available_preview_width = (header_width - reserved_width - px(2.0)).max(px(0.0));
         let rendered_preview = render_sticky_user_message_preview(
             message_segments,
+            search_highlights,
             has_more_message_content,
             available_preview_width,
             agent_ui_font_size,
