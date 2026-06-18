@@ -25,6 +25,11 @@ use util::paths::PathMatcher;
 
 use crate::entry_view_state::EntryViewState;
 
+use super::UserMessageContentSegment;
+use super::sticky_user_message_preview::{
+    StickyUserMessageSearchHighlights, sticky_user_message_search_highlights,
+};
+
 actions!(
     agent,
     [
@@ -279,6 +284,35 @@ impl ThreadSearchBar {
             Some(ix) => Some(format!("{}/{}", ix + 1, self.matches.len())),
             None => Some(format!("0/{}", self.matches.len())),
         }
+    }
+
+    pub(super) fn sticky_user_message_search_highlights(
+        &self,
+        entry_ix: usize,
+        segments: &[UserMessageContentSegment],
+        cx: &App,
+    ) -> Option<StickyUserMessageSearchHighlights> {
+        if !self.is_active || self.matches.iter().all(|mat| mat.entry_ix != entry_ix) {
+            return None;
+        }
+
+        let (query, _) = self.build_query(cx);
+        let query = query?;
+        let active_match_index = self.active_match.and_then(|active_match_index| {
+            let active_match = self.matches.get(active_match_index)?;
+            (active_match.entry_ix == entry_ix).then(|| {
+                self.matches[..active_match_index]
+                    .iter()
+                    .filter(|mat| mat.entry_ix == entry_ix)
+                    .count()
+            })
+        });
+
+        sticky_user_message_search_highlights(
+            segments,
+            |text| query.search_str(text),
+            active_match_index,
+        )
     }
 
     fn current_query(&self, cx: &App) -> String {
