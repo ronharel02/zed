@@ -7,7 +7,8 @@ use crate::{
         PromptCompletionProviderDelegate, PromptContextAction, PromptContextType,
         PromptLocalCommand, SlashCommandCompletion,
     },
-    mention_set::{Mention, MentionImage, MentionSet, insert_crease_for_mention},
+    mention_set::{Mention, MentionSet, insert_crease_for_mention},
+    user_message_content::UserMessageContent,
 };
 use acp_thread::MentionUri;
 use agent::ThreadStore;
@@ -25,8 +26,7 @@ use editor::{
 use futures::{FutureExt as _, future::join_all};
 use gpui::{
     AppContext, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Image, ImageFormat, KeyContext, SharedString, Subscription, Task, TaskExt,
-    TextStyle, WeakEntity,
+    Focusable, Image, KeyContext, SharedString, Subscription, Task, TaskExt, TextStyle, WeakEntity,
 };
 use language::{Buffer, language_settings::InlayHintKind};
 use parking_lot::RwLock;
@@ -37,7 +37,6 @@ use project::{
 use rope::Point;
 use settings::Settings;
 use std::{cmp::min, fmt::Write, ops::Range, rc::Rc, sync::Arc};
-use text::LineEnding;
 use theme_settings::ThemeSettings;
 use ui::{ContextMenu, prelude::*};
 use util::paths::PathStyle;
@@ -1688,8 +1687,23 @@ impl MessageEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            self.clear(window, cx);
+            return;
+        };
+        let path_style = workspace.read(cx).project().read(cx).path_style(cx);
+        let content = UserMessageContent::from_blocks(message, path_style);
+        self.set_message_content(content, window, cx);
+    }
+
+    pub(crate) fn set_message_content(
+        &mut self,
+        content: UserMessageContent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.clear(window, cx);
-        self.insert_message_blocks(message, false, window, cx);
+        self.insert_message_content(content, false, window, cx);
     }
 
     pub fn append_message(
@@ -1712,98 +1726,22 @@ impl MessageEditor {
             });
         }
 
-        self.insert_message_blocks(message, true, window, cx);
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let path_style = workspace.read(cx).project().read(cx).path_style(cx);
+        let content = UserMessageContent::from_blocks(message, path_style);
+        self.insert_message_content(content, true, window, cx);
     }
 
-    fn insert_message_blocks(
+    fn insert_message_content(
         &mut self,
-        message: Vec<acp::ContentBlock>,
+        content: UserMessageContent,
         append_to_existing: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-
-        let path_style = workspace.read(cx).project().read(cx).path_style(cx);
-        let mut text = String::new();
-        let mut mentions = Vec::new();
-        let append_normalized = |text: &mut String, mut segment: String| {
-            LineEnding::normalize(&mut segment);
-            text.push_str(&segment);
-        };
-
-        for chunk in message {
-            match chunk {
-                acp::ContentBlock::Text(text_content) => {
-                    append_normalized(&mut text, text_content.text);
-                }
-                acp::ContentBlock::Resource(acp::EmbeddedResource {
-                    resource: acp::EmbeddedResourceResource::TextResourceContents(resource),
-                    ..
-                }) => {
-                    let Some(mention_uri) = MentionUri::parse(&resource.uri, path_style).log_err()
-                    else {
-                        continue;
-                    };
-                    let start = text.len();
-                    append_normalized(&mut text, mention_uri.as_link().to_string());
-                    let end = text.len();
-                    mentions.push((
-                        start..end,
-                        mention_uri,
-                        Mention::Text {
-                            content: resource.text,
-                            tracked_buffers: Vec::new(),
-                        },
-                    ));
-                }
-                acp::ContentBlock::ResourceLink(resource) => {
-                    if let Some(mention_uri) =
-                        MentionUri::parse(&resource.uri, path_style).log_err()
-                    {
-                        let start = text.len();
-                        append_normalized(&mut text, mention_uri.as_link().to_string());
-                        let end = text.len();
-                        mentions.push((start..end, mention_uri, Mention::Link));
-                    }
-                }
-                acp::ContentBlock::Image(acp::ImageContent {
-                    uri,
-                    data,
-                    mime_type,
-                    ..
-                }) => {
-                    let mention_uri = if let Some(uri) = uri {
-                        MentionUri::parse(&uri, path_style)
-                    } else {
-                        Ok(MentionUri::PastedImage {
-                            name: "Image".to_string(),
-                        })
-                    };
-                    let Some(mention_uri) = mention_uri.log_err() else {
-                        continue;
-                    };
-                    let Some(format) = ImageFormat::from_mime_type(&mime_type) else {
-                        log::error!("failed to parse MIME type for image: {mime_type:?}");
-                        continue;
-                    };
-                    let start = text.len();
-                    append_normalized(&mut text, mention_uri.as_link().to_string());
-                    let end = text.len();
-                    mentions.push((
-                        start..end,
-                        mention_uri,
-                        Mention::Image(MentionImage {
-                            data: data.into(),
-                            format,
-                        }),
-                    ));
-                }
-                _ => {}
-            }
-        }
+        let (text, mentions) = content.into_parts();
 
         if text.is_empty() && mentions.is_empty() {
             return;
@@ -1827,17 +1765,17 @@ impl MessageEditor {
             })
         };
 
-        for (range, mention_uri, mention) in mentions {
-            let adjusted_start = insertion_start + range.start;
+        for mention in mentions {
+            let adjusted_start = insertion_start + mention.range.start;
             let anchor = snapshot.anchor_before(MultiBufferOffset(adjusted_start));
-            let image_preview = image_preview_task_for_mention(&mention);
+            let image_preview = image_preview_task_for_mention(&mention.content);
             let Some((crease_id, tx, crease_entity)) = insert_crease_for_mention(
                 snapshot.anchor_to_buffer_anchor(anchor).unwrap().0,
-                range.end - range.start,
-                mention_uri.name().into(),
-                mention_uri.icon_path(cx),
-                mention_uri.tooltip_text(),
-                Some(mention_uri.clone()),
+                mention.range.end - mention.range.start,
+                mention.uri.name().into(),
+                mention.uri.icon_path(cx),
+                mention.uri.tooltip_text(),
+                Some(mention.uri.clone()),
                 Some(self.workspace.clone()),
                 image_preview,
                 self.editor.clone(),
@@ -1851,8 +1789,8 @@ impl MessageEditor {
             self.mention_set.update(cx, |mention_set, cx| {
                 mention_set.insert_mention(
                     crease_id,
-                    mention_uri.clone(),
-                    Task::ready(Ok(mention)).shared(),
+                    mention.uri,
+                    Task::ready(Ok(mention.content)).shared(),
                     crease_entity,
                     cx,
                 )

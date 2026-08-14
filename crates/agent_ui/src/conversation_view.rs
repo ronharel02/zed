@@ -115,58 +115,6 @@ mod thread_view;
 pub use message_queue::*;
 pub use thread_view::*;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum UserMessageContentSegment {
-    Text(String),
-    Mention { uri: MentionUri, label: String },
-}
-
-pub(crate) fn parse_content_block(
-    block: &acp::ContentBlock,
-    path_style: PathStyle,
-) -> Option<UserMessageContentSegment> {
-    match block {
-        acp::ContentBlock::Text(text_content) => {
-            Some(UserMessageContentSegment::Text(text_content.text.clone()))
-        }
-        acp::ContentBlock::ResourceLink(link) => {
-            Some(match MentionUri::parse(&link.uri, path_style) {
-                Ok(uri) => UserMessageContentSegment::Mention {
-                    label: format!("@{}", uri.name()),
-                    uri,
-                },
-                Err(_) => UserMessageContentSegment::Text(format!("@{}", link.name)),
-            })
-        }
-        acp::ContentBlock::Resource(acp::EmbeddedResource {
-            resource: acp::EmbeddedResourceResource::TextResourceContents(resource),
-            ..
-        }) => Some(match MentionUri::parse(&resource.uri, path_style) {
-            Ok(uri) => UserMessageContentSegment::Mention {
-                label: format!("@{}", uri.name()),
-                uri,
-            },
-            Err(_) => UserMessageContentSegment::Text(resource.uri.clone()),
-        }),
-        acp::ContentBlock::Image(acp::ImageContent { uri, .. }) => {
-            let mention_uri = if let Some(uri) = uri {
-                match MentionUri::parse(uri, path_style) {
-                    Ok(uri) => uri,
-                    Err(_) => return Some(UserMessageContentSegment::Text(uri.clone())),
-                }
-            } else {
-                MentionUri::PastedImage {
-                    name: "Image".to_string(),
-                }
-            };
-            Some(UserMessageContentSegment::Mention {
-                label: format!("@{}", mention_uri.name()),
-                uri: mention_uri,
-            })
-        }
-        _ => None,
-    }
-}
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ThreadFeedback {
     Positive,
@@ -1703,12 +1651,8 @@ impl ConversationView {
             }
             AcpThreadEvent::EntriesRemoved(range) => {
                 if let Some(active) = self.thread_view(&session_id) {
-                    let entry_view_state = active.read(cx).entry_view_state.clone();
-                    let list_state = active.read(cx).list_state.clone();
-                    entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
-                    list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
-                        active.sync_editor_mode(cx);
+                        active.remove_entries(range.clone(), window, cx);
                     });
                 }
             }
@@ -6796,6 +6740,31 @@ pub(crate) mod tests {
         (conversation_view, cx)
     }
 
+    fn scroll_thread_to_item(
+        thread_view: &Entity<ThreadView>,
+        item_ix: usize,
+        cx: &mut VisualTestContext,
+    ) {
+        thread_view.update(cx, |view, _cx| {
+            view.list_state.scroll_to(ListOffset {
+                item_ix,
+                offset_in_item: px(0.0),
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    fn sticky_user_message_has_search_highlights(
+        thread_view: &Entity<ThreadView>,
+        cx: &VisualTestContext,
+    ) -> bool {
+        thread_view.read_with(cx, |view, cx| {
+            view.sticky_user_message_state(cx)
+                .expect("a user message should be sticky")
+                .has_search_highlights()
+        })
+    }
+
     #[gpui::test]
     async fn test_rewind_views(cx: &mut TestAppContext) {
         init_test(cx);
@@ -6839,6 +6808,7 @@ pub(crate) mod tests {
                 )
             })
         });
+        add_to_workspace(conversation_view.clone(), cx);
 
         cx.run_until_parked();
 
@@ -6936,6 +6906,30 @@ pub(crate) mod tests {
             });
         });
 
+        conversation_view.update(cx, |view, cx| {
+            view.active_thread()
+                .expect("active thread should exist")
+                .update(cx, |thread_view, _| {
+                    thread_view.editing_message = Some(2);
+                });
+        });
+        assert_eq!(
+            conversation_view.read_with(cx, |view, cx| {
+                view.active_thread()
+                    .and_then(|active| active.read(cx).editing_message)
+            }),
+            Some(2),
+        );
+
+        let unrelated_focus = conversation_view.read_with(cx, |view, cx| {
+            view.active_thread()
+                .expect("active thread should exist")
+                .read(cx)
+                .focus_handle
+                .clone()
+        });
+        cx.update(|window, cx| window.focus(&unrelated_focus, cx));
+
         // Rewind to first message
         thread
             .update(cx, |thread, cx| thread.rewind(second_user_message_id, cx))
@@ -6950,6 +6944,7 @@ pub(crate) mod tests {
 
         conversation_view.read_with(cx, |view, cx| {
             let active = view.active_thread().unwrap();
+            assert_eq!(active.read(cx).editing_message, None);
             active
                 .read(cx)
                 .entry_view_state
@@ -6967,6 +6962,12 @@ pub(crate) mod tests {
                     assert!(entry_view_state.entry(2).is_none());
                     assert!(entry_view_state.entry(3).is_none());
                 });
+        });
+        cx.update(|window, _cx| {
+            assert!(
+                unrelated_focus.is_focused(window),
+                "removing an edited entry from an unfocused view must not steal focus",
+            );
         });
     }
 
@@ -8238,6 +8239,158 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_sticky_user_message_searches_canonical_content(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_sticky_user_messages(cx);
+
+        let (conversation_view, cx) = setup_sticky_user_message_thread(cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        scroll_thread_to_item(&thread_view, 1, cx);
+        thread_view.update_in(cx, |view, window, cx| {
+            view.toggle_search(&crate::ToggleSearch, window, cx);
+        });
+        let search_bar = thread_view
+            .read_with(cx, |view, _| view.thread_search_bar.clone())
+            .expect("thread_search_bar should be set after toggle_search");
+        search_bar.update_in(cx, |bar, window, cx| {
+            bar.query_editor.update(cx, |editor, cx| {
+                editor.set_text("Prompt 1", window, cx);
+            });
+        });
+
+        assert_eq!(search_bar.read_with(cx, |bar, _| bar.match_count()), 0);
+        assert!(
+            sticky_user_message_has_search_highlights(&thread_view, cx),
+            "the sticky message should search canonical content without waiting for editor matches",
+        );
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_sticky_user_message_searches_canonical_content_while_message_is_dirty(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        enable_sticky_user_messages(cx);
+
+        let (conversation_view, cx) = setup_sticky_user_message_thread(cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.toggle_search(&crate::ToggleSearch, window, cx);
+        });
+        let search_bar = thread_view
+            .read_with(cx, |view, _| view.thread_search_bar.clone())
+            .expect("thread_search_bar should be set after toggle_search");
+        search_bar.update_in(cx, |bar, window, cx| {
+            bar.query_editor.update(cx, |editor, cx| {
+                editor.set_text("Prompt 1", window, cx);
+            });
+            bar.update_matches(window, cx);
+        });
+        cx.run_until_parked();
+
+        scroll_thread_to_item(&thread_view, 1, cx);
+        assert!(
+            sticky_user_message_has_search_highlights(&thread_view, cx),
+            "canonical content should show its search highlight",
+        );
+
+        let user_message_editor = thread_view.read_with(cx, |view, cx| {
+            view.entry_view_state
+                .read(cx)
+                .entry(0)
+                .and_then(|entry| entry.message_editor())
+                .cloned()
+                .expect("entry 0 should have a message editor")
+        });
+        scroll_thread_to_item(&thread_view, 0, cx);
+        cx.focus(&user_message_editor);
+        assert_eq!(
+            thread_view.read_with(cx, |view, _| view.editing_message),
+            Some(0),
+            "focusing the past message should start an edit session",
+        );
+        user_message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Dirty message", window, cx);
+        });
+        scroll_thread_to_item(&thread_view, 1, cx);
+        assert!(
+            sticky_user_message_has_search_highlights(&thread_view, cx),
+            "the sticky message should continue highlighting its canonical content",
+        );
+        assert_eq!(
+            thread_view.read_with(cx, |view, cx| {
+                view.entry_view_state
+                    .read(cx)
+                    .entry(0)
+                    .and_then(|entry| entry.user_message_canonical_text())
+                    .map(|text| text.to_string())
+            }),
+            Some("Prompt 1\nline 2\nline 3\nline 4\nline 5\nline 6".to_string()),
+            "the sticky message should retain the canonical submitted content",
+        );
+
+        search_bar.update_in(cx, |bar, window, cx| {
+            bar.query_editor.update(cx, |editor, cx| {
+                editor.set_text("Dirty", window, cx);
+            });
+        });
+        assert!(
+            !sticky_user_message_has_search_highlights(&thread_view, cx),
+            "unsaved editor text should not contribute sticky search highlights",
+        );
+        cx.run_until_parked();
+        assert_eq!(search_bar.read_with(cx, |bar, _| bar.match_count()), 1);
+        scroll_thread_to_item(&thread_view, 1, cx);
+
+        search_bar.update_in(cx, |bar, window, cx| {
+            bar.query_editor.update(cx, |editor, cx| {
+                editor.set_text("Prompt 1", window, cx);
+            });
+        });
+        assert!(sticky_user_message_has_search_highlights(&thread_view, cx));
+        cx.run_until_parked();
+        assert_eq!(search_bar.read_with(cx, |bar, _| bar.match_count()), 0);
+
+        let second_user_message_editor = thread_view.read_with(cx, |view, cx| {
+            view.entry_view_state
+                .read(cx)
+                .entry(2)
+                .and_then(|entry| entry.message_editor())
+                .cloned()
+                .expect("entry 2 should have a message editor")
+        });
+        cx.focus(&second_user_message_editor);
+        cx.focus(&user_message_editor);
+        cx.run_until_parked();
+        assert!(!thread_view.read_with(cx, |view, _| view.editing_message_was_edited()));
+        assert_eq!(
+            user_message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "Dirty message",
+        );
+
+        scroll_thread_to_item(&thread_view, 3, cx);
+        let scroll_top = thread_view.read_with(cx, |view, _| view.list_state.logical_scroll_top());
+        thread_view.update_in(cx, |view, window, cx| {
+            view.cancel_editing(&Default::default(), window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(search_bar.read_with(cx, |bar, _| bar.match_count()), 1);
+        thread_view.read_with(cx, |view, _| {
+            let current_scroll_top = view.list_state.logical_scroll_top();
+            assert_eq!(current_scroll_top.item_ix, scroll_top.item_ix);
+            assert_eq!(current_scroll_top.offset_in_item, scroll_top.offset_in_item);
+        });
+        scroll_thread_to_item(&thread_view, 1, cx);
+        assert!(
+            sticky_user_message_has_search_highlights(&thread_view, cx),
+            "cancelling the edit should restore canonical sticky highlights",
+        );
+    }
+
+    #[gpui::test]
     async fn test_message_editing_cancel(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -8250,51 +8403,65 @@ pub(crate) mod tests {
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::new(connection), cx).await;
         add_to_workspace(conversation_view.clone(), cx);
-
-        let message_editor = message_editor(&conversation_view, cx);
-        message_editor.update_in(cx, |editor, window, cx| {
-            editor.set_text("Original message to edit", window, cx);
-        });
-        active_thread(&conversation_view, cx)
-            .update_in(cx, |view, window, cx| view.send(window, cx));
-
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| {
+                thread.send(
+                    vec![
+                        acp::ContentBlock::Text(acp::TextContent::new("Review ")),
+                        acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                            "main.rs",
+                            "file:///project/main.rs",
+                        )),
+                    ],
+                    cx,
+                )
+            })
+            .await
+            .expect("message should send");
         cx.run_until_parked();
 
-        let user_message_editor = conversation_view.read_with(cx, |view, cx| {
-            assert_eq!(
-                view.active_thread()
-                    .and_then(|active| active.read(cx).editing_message),
-                None
-            );
-
-            view.active_thread()
-                .map(|active| &active.read(cx).entry_view_state)
-                .as_ref()
-                .unwrap()
+        let user_message_editor = thread_view.read_with(cx, |view, cx| {
+            view.entry_view_state
                 .read(cx)
                 .entry(0)
-                .unwrap()
-                .message_editor()
-                .unwrap()
-                .clone()
+                .and_then(|entry| entry.message_editor())
+                .cloned()
+                .expect("entry 0 should have a message editor")
         });
 
-        // Focus
         cx.focus(&user_message_editor);
-        conversation_view.read_with(cx, |view, cx| {
-            assert_eq!(
-                view.active_thread()
-                    .and_then(|active| active.read(cx).editing_message),
-                Some(0)
-            );
+        let canonical_text = "Review [@main.rs](file:///project/main.rs)";
+        user_message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("", window, cx);
+            editor.set_text(canonical_text, window, cx);
         });
+        assert!(user_message_editor.read_with(cx, |editor, cx| {
+            !editor
+                .draft_content_blocks_snapshot(cx)
+                .iter()
+                .any(|block| matches!(block, acp::ContentBlock::ResourceLink(_)))
+        }));
+        let thread_focus = thread_view.read_with(cx, |view, _cx| view.focus_handle.clone());
+        cx.update(|window, cx| window.focus(&thread_focus, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            thread_view.read_with(cx, |view, _| view.editing_message),
+            None
+        );
+        assert!(user_message_editor.read_with(cx, |editor, cx| {
+            editor
+                .draft_content_blocks_snapshot(cx)
+                .iter()
+                .any(|block| matches!(block, acp::ContentBlock::ResourceLink(_)))
+        }));
 
-        // Edit
+        cx.focus(&user_message_editor);
         user_message_editor.update_in(cx, |editor, window, cx| {
             editor.set_text("Edited message content", window, cx);
         });
 
-        // Cancel
         user_message_editor.update_in(cx, |_editor, window, cx| {
             window.dispatch_action(Box::new(editor::actions::Cancel), cx);
         });
@@ -8308,7 +8475,7 @@ pub(crate) mod tests {
         });
 
         user_message_editor.read_with(cx, |editor, cx| {
-            assert_eq!(editor.text(cx), "Original message to edit");
+            assert_eq!(editor.text(cx), canonical_text);
         });
     }
 
@@ -8472,8 +8639,8 @@ pub(crate) mod tests {
         message_editor.update_in(cx, |editor, window, cx| {
             editor.set_text("Original message to edit", window, cx);
         });
-        active_thread(&conversation_view, cx)
-            .update_in(cx, |view, window, cx| view.send(window, cx));
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
 
         cx.run_until_parked();
 
@@ -8499,6 +8666,30 @@ pub(crate) mod tests {
         // Focus
         cx.focus(&user_message_editor);
 
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(" continued".into())),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            user_message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "Original message to edit continued",
+        );
+        assert!(!thread_view.read_with(cx, |view, _| view.editing_message_was_edited()));
+
+        let thread_focus = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, _cx| view.focus_handle.clone());
+        cx.update(|window, cx| window.focus(&thread_focus, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.editing_message),
+            None,
+        );
+        cx.focus(&user_message_editor);
+
         conversation_view.read_with(cx, |view, cx| {
             assert_eq!(
                 view.active_thread()
@@ -8511,6 +8702,7 @@ pub(crate) mod tests {
         user_message_editor.update_in(cx, |editor, window, cx| {
             editor.set_text("Edited message content", window, cx);
         });
+        assert!(thread_view.read_with(cx, |view, _| view.editing_message_was_edited()));
 
         conversation_view.read_with(cx, |view, cx| {
             assert_eq!(

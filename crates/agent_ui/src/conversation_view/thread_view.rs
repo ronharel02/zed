@@ -6,7 +6,7 @@ use crate::{
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
 use agent_client_protocol::schema::v1 as acp;
-use std::cell::RefCell;
+use std::{cell::RefCell, ops::Range};
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
@@ -29,6 +29,10 @@ use crate::ui::{
     TerminalToolHeader,
 };
 use crate::unicode_confusables;
+use crate::{
+    entry_view_state::reindex_after_removal,
+    user_message_content::{UserMessageContent, UserMessageContentLineSegment},
+};
 
 use db::kvp::KeyValueStore;
 use gpui::{AvailableSpace, Bounds, List, ListOffset, Rems, Stateful, TaskExt};
@@ -47,16 +51,13 @@ use ui::{
 use util::markdown::{source_position_from_fragment, split_local_url_fragment};
 use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 
-use super::UserMessageContentSegment;
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
 use super::sticky_user_message_preview::{
-    StickyUserMessageSearchHighlights, parse_sticky_user_message_preview,
-    render_sticky_user_message_preview,
+    StickyUserMessageSearchHighlights, render_sticky_user_message_preview,
 };
 use super::*;
-
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
 const USER_MESSAGE_ROW_BOTTOM_PADDING: Rems = rems(0.75);
 
@@ -69,10 +70,17 @@ struct ThreadFeedbackState {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StickyUserMessageState {
     pub(crate) message_index: usize,
-    message_segments: Vec<UserMessageContentSegment>,
+    message_segments: Vec<UserMessageContentLineSegment>,
     search_highlights: Option<StickyUserMessageSearchHighlights>,
     pub(crate) has_more_message_content: bool,
     pub(crate) top_offset: Pixels,
+}
+
+#[cfg(test)]
+impl StickyUserMessageState {
+    pub(crate) fn has_search_highlights(&self) -> bool {
+        self.search_highlights.is_some()
+    }
 }
 
 impl ThreadFeedbackState {
@@ -619,6 +627,7 @@ pub struct ThreadView {
     pub editor_expanded: bool,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
+    editing_message_was_edited: bool,
     pub message_queue: MessageQueue,
     pub turn_fields: TurnFields,
     pub discarded_partial_edits: HashSet<acp::ToolCallId>,
@@ -1034,6 +1043,7 @@ impl ThreadView {
             editor_expanded: false,
             should_be_following: false,
             editing_message: None,
+            editing_message_was_edited: false,
             message_queue: MessageQueue::default(),
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
@@ -1265,6 +1275,111 @@ impl ThreadView {
         }
     }
 
+    fn finish_editing_message(&mut self) -> Option<usize> {
+        self.editing_message_was_edited = false;
+        self.editing_message.take()
+    }
+
+    #[cfg(test)]
+    pub(super) fn editing_message_was_edited(&self) -> bool {
+        self.editing_message_was_edited
+    }
+
+    fn canonical_user_message_content(
+        &self,
+        entry_index: usize,
+        cx: &App,
+    ) -> Option<UserMessageContent> {
+        UserMessageContent::for_thread_entry(&self.thread, entry_index, cx)
+    }
+
+    fn handle_user_message_blur(
+        &mut self,
+        entry_index: usize,
+        event_editor: &Entity<MessageEditor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing_message != Some(entry_index) {
+            return;
+        }
+
+        let Some((entry_editor, canonical_text)) = self
+            .entry_view_state
+            .read(cx)
+            .entry(entry_index)
+            .and_then(|entry| {
+                Some((
+                    entry.message_editor()?.clone(),
+                    entry.user_message_canonical_text()?.clone(),
+                ))
+            })
+        else {
+            self.finish_editing_message();
+            cx.notify();
+            return;
+        };
+        if entry_editor.entity_id() != event_editor.entity_id() {
+            return;
+        }
+        if event_editor.read(cx).text(cx).as_str() != canonical_text.as_ref() {
+            return;
+        }
+
+        let restored = self.editing_message_was_edited;
+        if restored {
+            let Some(canonical_content) = self.canonical_user_message_content(entry_index, cx)
+            else {
+                self.finish_editing_message();
+                cx.notify();
+                return;
+            };
+            event_editor.update(cx, |editor, cx| {
+                editor.set_message_content(canonical_content, window, cx);
+            });
+        }
+
+        self.finish_editing_message();
+        if restored {
+            self.refresh_thread_search(false, window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn remove_entries(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let edited_editor_was_focused = self
+            .editing_message
+            .and_then(|entry_index| {
+                self.entry_view_state
+                    .read(cx)
+                    .entry(entry_index)
+                    .and_then(|entry| entry.message_editor())
+            })
+            .is_some_and(|editor| editor.focus_handle(cx).is_focused(window));
+        let previous_editing_message = self.editing_message;
+
+        self.entry_view_state
+            .update(cx, |view_state, _cx| view_state.remove(range.clone()));
+        self.list_state.splice(range.clone(), 0);
+        self.editing_message = self
+            .editing_message
+            .and_then(|entry_index| reindex_after_removal(entry_index, &range));
+
+        if previous_editing_message.is_some() && self.editing_message.is_none() {
+            self.editing_message_was_edited = false;
+            if edited_editor_was_focused {
+                self.message_editor.focus_handle(cx).focus(window, cx);
+            }
+            cx.notify();
+        }
+        self.sync_editor_mode(cx);
+    }
+
     pub fn has_queued_messages(&self) -> bool {
         !self.message_queue.is_empty()
     }
@@ -1305,22 +1420,15 @@ impl ThreadView {
                     && user_message.client_id.is_some()
                     && !self.is_subagent()
                 {
-                    self.editing_message = Some(event.entry_index);
+                    if self.editing_message != Some(event.entry_index) {
+                        self.editing_message = Some(event.entry_index);
+                        self.editing_message_was_edited = false;
+                    }
                     cx.notify();
                 }
             }
             ViewEvent::MessageEditorEvent(editor, MessageEditorEvent::LostFocus) => {
-                if let Some(AgentThreadEntry::UserMessage(user_message)) =
-                    self.thread.read(cx).entries().get(event.entry_index)
-                    && self.thread.read(cx).supports_truncate(cx)
-                    && user_message.client_id.is_some()
-                    && !self.is_subagent()
-                {
-                    if editor.read(cx).text(cx).as_str() == user_message.content.to_markdown(cx) {
-                        self.editing_message = None;
-                        cx.notify();
-                    }
-                }
+                self.handle_user_message_blur(event.entry_index, editor, window, cx);
             }
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::SendImmediately) => {}
             ViewEvent::MessageEditorEvent(editor, MessageEditorEvent::Send) => {
@@ -1334,7 +1442,34 @@ impl ThreadView {
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::SlashAutocompleteOpened) => {
             }
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::LocalCommandInvoked(_)) => {}
-            ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::Edited) => {}
+            ViewEvent::MessageEditorEvent(editor, MessageEditorEvent::Edited) => {
+                if self.editing_message == Some(event.entry_index)
+                    && !self.editing_message_was_edited
+                {
+                    let editor_text_differs = self
+                        .entry_view_state
+                        .read(cx)
+                        .entry(event.entry_index)
+                        .and_then(|entry| entry.user_message_canonical_text())
+                        .is_none_or(|canonical_text| {
+                            editor.read(cx).text(cx).as_str() != canonical_text.as_ref()
+                        });
+                    let editor_projection_differs = !editor_text_differs
+                        && self
+                            .canonical_user_message_content(event.entry_index, cx)
+                            .is_none_or(|canonical_content| {
+                                let path_style =
+                                    self.thread.read(cx).project().read(cx).path_style(cx);
+                                let editor_content = UserMessageContent::from_blocks(
+                                    editor.read(cx).draft_content_blocks_snapshot(cx),
+                                    path_style,
+                                );
+                                !editor_content.has_same_projection(&canonical_content)
+                            });
+                    self.editing_message_was_edited =
+                        editor_text_differs || editor_projection_differs;
+                }
+            }
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::InputAttempted { .. }) => {}
             ViewEvent::OpenDiffLocation {
                 path,
@@ -1582,7 +1717,7 @@ impl ThreadView {
         let contents = self.resolve_message_contents(&message_editor, cx);
         self.thread_error.take();
         self.thread_feedback.clear();
-        self.editing_message.take();
+        self.finish_editing_message();
 
         cx.spawn_in(window, async move |this, cx| {
             let (mut content, tracked_buffers) = contents.await?;
@@ -1637,7 +1772,7 @@ impl ThreadView {
 
         self.thread_error.take();
         self.thread_feedback.clear();
-        self.editing_message.take();
+        self.finish_editing_message();
         // Sending a message is active engagement: un-freeze the queue if it
         // was paused by a manual stop.
         self.message_queue.resume();
@@ -2469,26 +2604,28 @@ impl ThreadView {
     }
 
     pub fn cancel_editing(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = self.editing_message.take()
-            && let Some(editor) = &self
+        let was_edited = self.editing_message_was_edited;
+        let mut restored = false;
+        if let Some(index) = self.finish_editing_message()
+            && let Some(editor) = self
                 .entry_view_state
                 .read(cx)
                 .entry(index)
-                .and_then(|e| e.message_editor())
+                .and_then(|entry| entry.message_editor())
                 .cloned()
+            && let Some(content) = self.canonical_user_message_content(index, cx)
         {
-            editor.update(cx, |editor, cx| {
-                if let Some(user_message) = self
-                    .thread
-                    .read(cx)
-                    .entries()
-                    .get(index)
-                    .and_then(|e| e.user_message())
-                {
-                    editor.set_message(user_message.chunks.clone(), window, cx);
-                }
-            })
-        };
+            let editor_text_differs = editor.read(cx).text(cx).as_str() != content.text().as_ref();
+            if editor_text_differs || was_edited {
+                editor.update(cx, |editor, cx| {
+                    editor.set_message_content(content, window, cx);
+                });
+                restored = true;
+            }
+        }
+        if restored {
+            self.refresh_thread_search(false, window, cx);
+        }
         self.message_editor.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
@@ -4050,7 +4187,7 @@ impl ThreadView {
                                                             state.collapse_compaction(entry_ix);
                                                         },
                                                     );
-                                                    this.refresh_thread_search(window, cx);
+                                                    this.refresh_thread_search(true, window, cx);
                                                     cx.notify();
                                                 },
                                             ),
@@ -4086,7 +4223,7 @@ impl ThreadView {
             state.toggle_compaction_expansion(entry_ix);
         });
         self.list_state.remeasure_items(entry_ix..entry_ix + 1);
-        self.refresh_thread_search(window, cx);
+        self.refresh_thread_search(true, window, cx);
         cx.notify();
     }
 
@@ -7160,12 +7297,23 @@ impl ThreadView {
         }
     }
 
-    fn refresh_thread_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn refresh_thread_search(
+        &mut self,
+        scroll_to_new_match: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.thread_search_visible {
             return;
         }
         if let Some(bar) = self.thread_search_bar.clone() {
-            bar.update(cx, |bar, cx| bar.update_matches(window, cx));
+            bar.update(cx, |bar, cx| {
+                if scroll_to_new_match {
+                    bar.update_matches(window, cx);
+                } else {
+                    bar.update_matches_without_scrolling(window, cx);
+                }
+            });
         }
     }
 
@@ -7442,7 +7590,7 @@ impl ThreadView {
         self.entry_view_state.update(cx, |state, cx| {
             state.toggle_thinking_block_expansion(key, cx);
         });
-        self.refresh_thread_search(window, cx);
+        self.refresh_thread_search(true, window, cx);
         cx.notify();
     }
 
@@ -7958,7 +8106,7 @@ impl ThreadView {
                 this.entry_view_state.update(cx, |state, _cx| {
                     state.toggle_tool_call_expansion(&id);
                 });
-                this.refresh_thread_search(window, cx);
+                this.refresh_thread_search(true, window, cx);
                 cx.notify();
             }
         }))
@@ -8458,7 +8606,7 @@ impl ThreadView {
                                                 this.entry_view_state.update(cx, |state, _cx| {
                                                     state.collapse_tool_call(&tool_call_id);
                                                 });
-                                                this.refresh_thread_search(window, cx);
+                                                this.refresh_thread_search(true, window, cx);
                                                 cx.notify();
                                             }
                                         })),
@@ -8560,7 +8708,7 @@ impl ThreadView {
                                                                             );
                                                                     },
                                                                 );
-                                                                this.refresh_thread_search(window, cx);
+                                                                this.refresh_thread_search(true, window, cx);
                                                                 cx.notify();
                                                             }
                                                         })),
@@ -10015,9 +10163,6 @@ impl ThreadView {
             return None;
         }
 
-        let path_style = self
-            .thread
-            .read_with(cx, |thread, cx| thread.project().read(cx).path_style(cx));
         let entries = self.thread.read(cx).entries();
         if entries.is_empty() {
             return None;
@@ -10066,30 +10211,31 @@ impl ThreadView {
             return None;
         }
 
-        let message = match entries.get(message_index) {
-            Some(AgentThreadEntry::UserMessage(message)) => message,
-            _ => return None,
-        };
-
-        let preview = parse_sticky_user_message_preview(&message.chunks, path_style);
-        let search_highlights = self
-            .thread_search_visible
-            .then(|| {
+        let (line, search_highlights) = {
+            let entry_view_state = self.entry_view_state.read(cx);
+            let entry = entry_view_state.entry(message_index)?;
+            let line = entry.user_message_content_line()?.clone();
+            let show_active_match =
+                self.editing_message != Some(message_index) || !self.editing_message_was_edited;
+            let search_highlights = if self.thread_search_visible {
                 self.thread_search_bar.as_ref().and_then(|bar| {
                     bar.read(cx).sticky_user_message_search_highlights(
                         message_index,
-                        &preview.segments,
-                        cx,
+                        &line,
+                        show_active_match,
                     )
                 })
-            })
-            .flatten();
+            } else {
+                None
+            };
+            (line, search_highlights)
+        };
 
         Some(StickyUserMessageState {
             message_index,
-            message_segments: preview.segments,
+            message_segments: line.segments,
             search_highlights,
-            has_more_message_content: preview.has_more_message_content,
+            has_more_message_content: line.has_more_content,
             top_offset: Self::sticky_user_message_top_offset(push_progress, sticky_header_height),
         })
     }
@@ -11053,7 +11199,7 @@ impl ThreadView {
                                                     state.toggle_tool_call_expansion(&tool_call_id);
                                                     state.is_tool_call_expanded(&tool_call_id)
                                                 });
-                                            this.refresh_thread_search(window, cx);
+                                            this.refresh_thread_search(true, window, cx);
                                             telemetry::event!("Subagent Toggled", expanded);
                                             cx.notify();
                                         }

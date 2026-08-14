@@ -1,18 +1,9 @@
 use std::ops::Range;
 
-use agent_client_protocol::schema::v1 as acp;
 use gpui::{AnyElement, App, AvailableSpace, HighlightStyle, Pixels, StyledText, Window};
 use ui::{LabelLike, prelude::*};
-use util::paths::PathStyle;
 
-use super::{UserMessageContentSegment, parse_content_block};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StickyUserMessagePreview {
-    pub(crate) segments: Vec<UserMessageContentSegment>,
-    pub(crate) text: String,
-    pub(crate) has_more_message_content: bool,
-}
+use crate::user_message_content::{UserMessageContentLineSegment, UserMessageContentSegment};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StickyUserMessageSearchHighlight {
@@ -25,82 +16,46 @@ pub(crate) struct StickyUserMessageSearchHighlights {
     segment_ranges: Vec<Vec<StickyUserMessageSearchHighlight>>,
 }
 
-pub(crate) fn parse_sticky_user_message_preview(
-    chunks: &[acp::ContentBlock],
-    path_style: PathStyle,
-) -> StickyUserMessagePreview {
-    let (segments, has_more_message_content) = segmented_preview_line(chunks, path_style);
-    let text = segments.iter().map(segment_text).collect();
-
-    StickyUserMessagePreview {
-        segments,
-        text,
-        has_more_message_content,
-    }
-}
-
-fn segment_text(segment: &UserMessageContentSegment) -> &str {
-    match segment {
-        UserMessageContentSegment::Text(text) => text,
-        UserMessageContentSegment::Mention { label, .. } => label,
-    }
-}
-
-fn sticky_user_message_display_segments(
-    segments: Vec<UserMessageContentSegment>,
-) -> Vec<UserMessageContentSegment> {
-    let mut merged_segments = Vec::new();
-
-    for segment in segments {
-        match segment {
-            UserMessageContentSegment::Text(text) => {
-                if let Some(UserMessageContentSegment::Text(previous_text)) =
-                    merged_segments.last_mut()
-                {
-                    previous_text.push_str(&text);
-                } else {
-                    merged_segments.push(UserMessageContentSegment::Text(text));
-                }
-            }
-            UserMessageContentSegment::Mention { .. } => merged_segments.push(segment),
-        }
-    }
-
-    merged_segments
-        .into_iter()
-        .filter_map(|segment| match segment {
-            UserMessageContentSegment::Text(text) => {
-                let text = text.trim();
-                (!text.is_empty()).then(|| UserMessageContentSegment::Text(text.to_string()))
-            }
-            UserMessageContentSegment::Mention { .. } => Some(segment),
-        })
-        .collect()
-}
-
 pub(crate) fn sticky_user_message_search_highlights(
-    segments: &[UserMessageContentSegment],
-    mut search_ranges: impl FnMut(&str) -> Vec<Range<usize>>,
-    active_match_index: Option<usize>,
+    segments: &[UserMessageContentLineSegment],
+    matches: impl IntoIterator<Item = (Range<usize>, bool)>,
 ) -> Option<StickyUserMessageSearchHighlights> {
-    let mut match_index = 0;
-    let mut has_ranges = false;
-    let segment_ranges = sticky_user_message_display_segments(segments.to_vec())
-        .iter()
-        .map(|segment| {
-            search_ranges(segment_text(segment))
-                .into_iter()
-                .map(|range| {
-                    has_ranges = true;
-                    let is_active = active_match_index == Some(match_index);
-                    match_index += 1;
-                    StickyUserMessageSearchHighlight { range, is_active }
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+    let mut segment_ranges = None;
+    for (match_range, is_active) in matches {
+        if match_range.is_empty() {
+            continue;
+        }
+        let Some((segment_index, segment, source_range)) =
+            segments.iter().enumerate().find_map(|(index, segment)| {
+                let source_range = segment.source_range.as_ref()?;
+                (match_range.start >= source_range.start && match_range.end <= source_range.end)
+                    .then_some((index, segment, source_range))
+            })
+        else {
+            continue;
+        };
 
-    has_ranges.then_some(StickyUserMessageSearchHighlights { segment_ranges })
+        let display_range =
+            match_range.start - source_range.start..match_range.end - source_range.start;
+        let display_text = segment.display_text();
+        if display_range.end > display_text.len()
+            || !display_text.is_char_boundary(display_range.start)
+            || !display_text.is_char_boundary(display_range.end)
+        {
+            continue;
+        }
+
+        segment_ranges.get_or_insert_with(|| vec![Vec::new(); segments.len()])[segment_index].push(
+            StickyUserMessageSearchHighlight {
+                range: display_range,
+                is_active,
+            },
+        );
+    }
+
+    Some(StickyUserMessageSearchHighlights {
+        segment_ranges: segment_ranges?,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -171,7 +126,7 @@ fn sticky_user_message_preview_width(
 }
 
 pub(crate) fn render_sticky_user_message_preview(
-    segments: Vec<UserMessageContentSegment>,
+    segments: Vec<UserMessageContentLineSegment>,
     search_highlights: Option<StickyUserMessageSearchHighlights>,
     has_more_message_content: bool,
     available_width: Pixels,
@@ -179,7 +134,6 @@ pub(crate) fn render_sticky_user_message_preview(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let segments = sticky_user_message_display_segments(segments);
     let render_text = |text: String,
                        highlights: Option<&Vec<StickyUserMessageSearchHighlight>>,
                        truncate: bool,
@@ -231,13 +185,13 @@ pub(crate) fn render_sticky_user_message_preview(
         }
     };
     let render_segment = |index: usize,
-                          segment: UserMessageContentSegment,
+                          segment: UserMessageContentLineSegment,
                           truncate: bool,
                           cx: &mut App| {
         let highlights = search_highlights
             .as_ref()
             .and_then(|highlights| highlights.segment_ranges.get(index));
-        match segment {
+        match segment.content {
             UserMessageContentSegment::Text(text) => render_text(text, highlights, truncate, cx),
             UserMessageContentSegment::Mention { uri, label } => h_flex()
                 .id(("sticky-user-message-mention", index))
@@ -300,12 +254,18 @@ pub(crate) fn render_sticky_user_message_preview(
 
     let include_dropped_text = segments
         .get(fit.visible_segment_count)
-        .is_some_and(|s| matches!(s, UserMessageContentSegment::Text(_)));
+        .is_some_and(|segment| matches!(segment.content, UserMessageContentSegment::Text(_)));
     let visible_segment_count = fit.visible_segment_count + usize::from(include_dropped_text);
     let truncated_text_index = if include_dropped_text {
         Some(fit.visible_segment_count)
     } else if segments.len() == 1
-        && matches!(segments.first(), Some(UserMessageContentSegment::Text(_)))
+        && matches!(
+            segments.first(),
+            Some(UserMessageContentLineSegment {
+                content: UserMessageContentSegment::Text(_),
+                ..
+            })
+        )
     {
         Some(0)
     } else {
@@ -337,174 +297,15 @@ pub(crate) fn render_sticky_user_message_preview(
         .into_any_element()
 }
 
-fn trim_segments(mut segments: Vec<UserMessageContentSegment>) -> Vec<UserMessageContentSegment> {
-    while matches!(segments.first(), Some(UserMessageContentSegment::Text(text)) if text.trim_start().is_empty())
-    {
-        segments.remove(0);
-    }
-
-    while matches!(segments.last(), Some(UserMessageContentSegment::Text(text)) if text.trim_end().is_empty())
-    {
-        segments.pop();
-    }
-
-    if let Some(UserMessageContentSegment::Text(text)) = segments.first_mut() {
-        *text = text.trim_start().to_string();
-    }
-
-    if let Some(UserMessageContentSegment::Text(text)) = segments.last_mut() {
-        *text = text.trim_end().to_string();
-    }
-
-    segments
-        .into_iter()
-        .filter(
-            |segment| !matches!(segment, UserMessageContentSegment::Text(text) if text.is_empty()),
-        )
-        .collect()
-}
-
-fn segmented_preview_line(
-    chunks: &[acp::ContentBlock],
-    path_style: PathStyle,
-) -> (Vec<UserMessageContentSegment>, bool) {
-    fn finish_line(
-        current_line_segments: &mut Vec<UserMessageContentSegment>,
-        first_non_empty_line_segments: &mut Option<Vec<UserMessageContentSegment>>,
-    ) -> bool {
-        let trimmed_segments = trim_segments(std::mem::take(current_line_segments));
-        if trimmed_segments.is_empty() {
-            return false;
-        }
-
-        if first_non_empty_line_segments.is_none() {
-            *first_non_empty_line_segments = Some(trimmed_segments);
-            false
-        } else {
-            true
-        }
-    }
-
-    let mut first_non_empty_line_segments = None;
-    let mut current_line_segments = Vec::new();
-    let mut has_more_message_content = false;
-
-    for chunk in chunks {
-        match parse_content_block(chunk, path_style) {
-            Some(UserMessageContentSegment::Text(text)) => {
-                let mut lines = text.split('\n').peekable();
-                while let Some(line) = lines.next() {
-                    if !line.is_empty() {
-                        current_line_segments
-                            .push(UserMessageContentSegment::Text(line.to_string()));
-                    }
-
-                    if lines.peek().is_some()
-                        && finish_line(
-                            &mut current_line_segments,
-                            &mut first_non_empty_line_segments,
-                        )
-                    {
-                        has_more_message_content = true;
-                        break;
-                    }
-                }
-            }
-            Some(segment) => {
-                current_line_segments.push(segment);
-            }
-            None => {}
-        }
-
-        if has_more_message_content {
-            break;
-        }
-    }
-
-    if !has_more_message_content
-        && finish_line(
-            &mut current_line_segments,
-            &mut first_non_empty_line_segments,
-        )
-    {
-        has_more_message_content = true;
-    }
-
-    (
-        first_non_empty_line_segments
-            .unwrap_or_else(|| vec![UserMessageContentSegment::Text("Message".to_string())]),
-        has_more_message_content,
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use acp_thread::MentionUri;
-
     use super::*;
 
-    #[test]
-    fn uses_structured_labels_for_references() {
-        let chunks = vec![
-            acp::ContentBlock::Text(acp::TextContent::new("Check ")),
-            acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
-                "main.rs",
-                "file:///project/main.rs",
-            )),
-            acp::ContentBlock::Text(acp::TextContent::new(" and ")),
-            acp::ContentBlock::Resource(acp::EmbeddedResource::new(
-                acp::EmbeddedResourceResource::TextResourceContents(
-                    acp::TextResourceContents::new("fn main() {}", "file:///project/lib.rs"),
-                ),
-            )),
-        ];
-
-        let preview = parse_sticky_user_message_preview(&chunks, PathStyle::Unix);
-
-        assert!(matches!(
-            preview.segments.as_slice(),
-            [
-                UserMessageContentSegment::Text(_),
-                UserMessageContentSegment::Mention { .. },
-                UserMessageContentSegment::Text(_),
-                UserMessageContentSegment::Mention { .. }
-            ]
-        ));
-        assert_eq!(preview.text, "Check @main.rs and @lib.rs");
-        assert!(!preview.has_more_message_content);
-    }
-
-    #[test]
-    fn uses_image_label_instead_of_markdown_placeholder() {
-        let chunks = vec![
-            acp::ContentBlock::Image(
-                acp::ImageContent::new("ignored", "image/png")
-                    .uri("zed:///agent/pasted-image?name=Diagram"),
-            ),
-            acp::ContentBlock::Text(acp::TextContent::new("\nExplain this diagram")),
-        ];
-
-        let preview = parse_sticky_user_message_preview(&chunks, PathStyle::Unix);
-
-        assert!(matches!(
-            preview.segments.as_slice(),
-            [UserMessageContentSegment::Mention { .. }]
-        ));
-        assert_eq!(preview.text, "@Diagram");
-        assert!(preview.has_more_message_content);
-    }
-
-    #[test]
-    fn display_segments_coalesce_adjacent_text() {
-        let segments = sticky_user_message_display_segments(vec![
-            UserMessageContentSegment::Text("hel".to_string()),
-            UserMessageContentSegment::Text("lo world".to_string()),
-        ]);
-
-        assert_eq!(
-            segments,
-            vec![UserMessageContentSegment::Text("hello world".to_string())]
-        );
+    fn text_segment(text: &str, source_range: Range<usize>) -> UserMessageContentLineSegment {
+        UserMessageContentLineSegment {
+            content: UserMessageContentSegment::Text(text.to_string()),
+            source_range: Some(source_range),
+        }
     }
 
     #[test]
@@ -551,27 +352,14 @@ mod tests {
 
     #[test]
     fn search_highlights_are_mapped_to_display_segments() {
-        let segments = vec![
-            UserMessageContentSegment::Text("Check ".to_string()),
-            UserMessageContentSegment::Mention {
-                uri: MentionUri::PastedImage {
-                    name: "main.rs".to_string(),
-                },
-                label: "@main.rs".to_string(),
-            },
-            UserMessageContentSegment::Text(" and main.rs".to_string()),
+        let segments = [
+            text_segment("first", 0..5),
+            text_segment("reference", 6..15),
+            text_segment("more content", 16..28),
         ];
-
-        let highlights = sticky_user_message_search_highlights(
-            &segments,
-            |text| {
-                text.match_indices("main")
-                    .map(|(start, text)| start..start + text.len())
-                    .collect()
-            },
-            Some(1),
-        )
-        .expect("expected matches in sticky preview");
+        let highlights =
+            sticky_user_message_search_highlights(&segments, [(7..11, false), (20..24, true)])
+                .expect("expected matches in sticky preview");
 
         assert_eq!(highlights.segment_ranges[0], Vec::new());
         assert_eq!(highlights.segment_ranges[1].len(), 1);
@@ -583,127 +371,12 @@ mod tests {
     }
 
     #[test]
-    fn display_segments_drop_separator_whitespace() {
-        let segments = vec![
-            UserMessageContentSegment::Text("Hello ".to_string()),
-            UserMessageContentSegment::Mention {
-                uri: MentionUri::PastedImage {
-                    name: "one".to_string(),
-                },
-                label: "@one".to_string(),
-            },
-            UserMessageContentSegment::Text(" ".to_string()),
-            UserMessageContentSegment::Mention {
-                uri: MentionUri::PastedImage {
-                    name: "two".to_string(),
-                },
-                label: "@two".to_string(),
-            },
-        ];
-
-        let segments = sticky_user_message_display_segments(segments);
+    fn search_highlights_skip_empty_and_invalid_utf8_ranges() {
+        let segments = [text_segment("éclair", 0..7)];
 
         assert_eq!(
-            segments,
-            vec![
-                UserMessageContentSegment::Text("Hello".to_string()),
-                UserMessageContentSegment::Mention {
-                    uri: MentionUri::PastedImage {
-                        name: "one".to_string(),
-                    },
-                    label: "@one".to_string(),
-                },
-                UserMessageContentSegment::Mention {
-                    uri: MentionUri::PastedImage {
-                        name: "two".to_string(),
-                    },
-                    label: "@two".to_string(),
-                },
-            ]
+            sticky_user_message_search_highlights(&segments, [(0..0, false), (1..3, true)]),
+            None
         );
-    }
-
-    #[test]
-    fn falls_back_to_message_for_empty_preview_content() {
-        let chunks = vec![acp::ContentBlock::Text(acp::TextContent::new("\n   \n"))];
-
-        let preview = parse_sticky_user_message_preview(&chunks, PathStyle::Unix);
-
-        assert_eq!(
-            preview.segments,
-            vec![UserMessageContentSegment::Text("Message".to_string())]
-        );
-        assert_eq!(preview.text, "Message");
-        assert!(!preview.has_more_message_content);
-    }
-
-    #[test]
-    fn trims_surrounding_whitespace_on_first_non_empty_line() {
-        let chunks = vec![acp::ContentBlock::Text(acp::TextContent::new(
-            "\n   hello world   \n",
-        ))];
-
-        let preview = parse_sticky_user_message_preview(&chunks, PathStyle::Unix);
-
-        assert_eq!(
-            preview.segments,
-            vec![UserMessageContentSegment::Text("hello world".to_string())]
-        );
-        assert_eq!(preview.text, "hello world");
-        assert!(!preview.has_more_message_content);
-    }
-
-    #[test]
-    fn marks_has_more_content_when_later_non_empty_lines_exist() {
-        let chunks = vec![acp::ContentBlock::Text(acp::TextContent::new(
-            "\nFirst line\n\nSecond line",
-        ))];
-
-        let preview = parse_sticky_user_message_preview(&chunks, PathStyle::Unix);
-
-        assert_eq!(
-            preview.segments,
-            vec![UserMessageContentSegment::Text("First line".to_string())]
-        );
-        assert_eq!(preview.text, "First line");
-        assert!(preview.has_more_message_content);
-    }
-
-    #[test]
-    fn falls_back_to_resource_name_for_invalid_resource_link_uri() {
-        let chunks = vec![acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
-            "notes.md",
-            "not a valid uri",
-        ))];
-
-        let preview = parse_sticky_user_message_preview(&chunks, PathStyle::Unix);
-
-        assert_eq!(
-            preview.segments,
-            vec![UserMessageContentSegment::Text("@notes.md".to_string())]
-        );
-        assert_eq!(preview.text, "@notes.md");
-        assert!(!preview.has_more_message_content);
-    }
-
-    #[test]
-    fn falls_back_to_raw_uri_for_invalid_embedded_resource_uri() {
-        let chunks = vec![acp::ContentBlock::Resource(acp::EmbeddedResource::new(
-            acp::EmbeddedResourceResource::TextResourceContents(acp::TextResourceContents::new(
-                "contents",
-                "not a valid uri",
-            )),
-        ))];
-
-        let preview = parse_sticky_user_message_preview(&chunks, PathStyle::Unix);
-
-        assert_eq!(
-            preview.segments,
-            vec![UserMessageContentSegment::Text(
-                "not a valid uri".to_string()
-            )]
-        );
-        assert_eq!(preview.text, "not a valid uri");
-        assert!(!preview.has_more_message_content);
     }
 }
