@@ -24,9 +24,8 @@ use ui::{IconButtonShape, Tooltip, prelude::*};
 use util::paths::PathMatcher;
 
 use super::subagent_card::acp_subagent_card;
-use crate::entry_view_state::EntryViewState;
+use crate::{entry_view_state::EntryViewState, user_message_content::UserMessageContentLine};
 
-use super::UserMessageContentSegment;
 use super::sticky_user_message_preview::{
     StickyUserMessageSearchHighlights, sticky_user_message_search_highlights,
 };
@@ -107,6 +106,13 @@ struct MatchKey {
     source_range: Range<usize>,
 }
 
+#[derive(Clone, Copy)]
+enum MatchActivation {
+    Preserve,
+    SelectWithoutScrolling,
+    SelectAndScroll,
+}
+
 enum SearchTarget {
     Editor {
         entry_ix: usize,
@@ -141,6 +147,7 @@ pub struct ThreadSearchBar {
     active_match: Option<usize>,
     query_error: bool,
     query_error_message: Option<SharedString>,
+    search_query: Option<Arc<SearchQuery>>,
     highlighted_markdowns: Vec<WeakEntity<Markdown>>,
     highlighted_editors: Vec<WeakEntity<Editor>>,
     thread: Entity<AcpThread>,
@@ -219,6 +226,7 @@ impl ThreadSearchBar {
             active_match: None,
             query_error: false,
             query_error_message: None,
+            search_query: None,
             highlighted_markdowns: Vec::new(),
             highlighted_editors: Vec::new(),
             thread,
@@ -290,29 +298,32 @@ impl ThreadSearchBar {
     pub(super) fn sticky_user_message_search_highlights(
         &self,
         entry_ix: usize,
-        segments: &[UserMessageContentSegment],
-        cx: &App,
+        line: &UserMessageContentLine,
+        show_active_match: bool,
     ) -> Option<StickyUserMessageSearchHighlights> {
-        if !self.is_active || self.matches.iter().all(|mat| mat.entry_ix != entry_ix) {
+        if !self.is_active {
             return None;
         }
-
-        let (query, _) = self.build_query(cx);
-        let query = query?;
-        let active_match_index = self.active_match.and_then(|active_match_index| {
-            let active_match = self.matches.get(active_match_index)?;
-            (active_match.entry_ix == entry_ix).then(|| {
-                self.matches[..active_match_index]
-                    .iter()
-                    .filter(|mat| mat.entry_ix == entry_ix)
-                    .count()
+        let query = self.search_query.as_ref()?;
+        let line_range = line.source_range()?;
+        let active_source_range = if show_active_match {
+            self.active_match.and_then(|active_match_index| {
+                let active_match = self.matches.get(active_match_index)?;
+                (active_match.entry_ix == entry_ix).then_some(&active_match.source_range)
             })
-        });
-
+        } else {
+            None
+        };
         sticky_user_message_search_highlights(
-            segments,
-            |text| query.search_str(text),
-            active_match_index,
+            &line.segments,
+            query
+                .search_str(line.message_text())
+                .into_iter()
+                .filter(|range| range.start >= line_range.start && range.end <= line_range.end)
+                .map(|range| {
+                    let is_active = active_source_range == Some(&range);
+                    (range, is_active)
+                }),
         )
     }
 
@@ -358,6 +369,23 @@ impl ThreadSearchBar {
     }
 
     pub(super) fn update_matches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_matches_with_scroll(true, window, cx);
+    }
+
+    pub(super) fn update_matches_without_scrolling(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_matches_with_scroll(false, window, cx);
+    }
+
+    fn update_matches_with_scroll(
+        &mut self,
+        scroll_to_new_match: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let previous_active_match_ix = self.active_match;
         let previous_active_key = previous_active_match_ix
             .and_then(|ix| self.matches.get(ix))
@@ -366,6 +394,7 @@ impl ThreadSearchBar {
         let (query, err_msg) = self.build_query(cx);
         self.query_error = !self.current_query(cx).is_empty() && query.is_none();
         self.query_error_message = err_msg;
+        self.search_query = query.clone();
 
         let Some(query) = query else {
             self.patch_buffer_subscriptions.clear();
@@ -382,11 +411,13 @@ impl ThreadSearchBar {
             match entry {
                 // Past user messages render through `MessageEditor`, not markdown.
                 AgentThreadEntry::UserMessage(_) => {
-                    let editor = entry_view_state
-                        .entry(entry_ix)
-                        .and_then(|view_entry| view_entry.message_editor())
-                        .map(|message_editor| message_editor.read(cx).editor().clone());
-                    let Some(editor) = editor else {
+                    let Some(view_entry) = entry_view_state.entry(entry_ix) else {
+                        continue;
+                    };
+                    let Some(editor) = view_entry
+                        .message_editor()
+                        .map(|message_editor| message_editor.read(cx).editor().clone())
+                    else {
                         continue;
                     };
                     let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
@@ -517,6 +548,7 @@ impl ThreadSearchBar {
                     scanned,
                     previous_active_key,
                     previous_active_match_ix,
+                    scroll_to_new_match,
                     window,
                     cx,
                 );
@@ -530,6 +562,7 @@ impl ThreadSearchBar {
         scanned: Vec<ScannedTarget>,
         previous_active_key: Option<MatchKey>,
         previous_active_match_ix: Option<usize>,
+        scroll_to_new_match: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -591,8 +624,14 @@ impl ThreadSearchBar {
             let active_match_ix = preserved_ix
                 .or_else(|| previous_active_match_ix.filter(|ix| *ix < self.matches.len()))
                 .unwrap_or(0);
-            let scroll_to_match = preserved_ix.is_none();
-            self.activate_match(active_match_ix, scroll_to_match, window, cx);
+            let activation = if preserved_ix.is_some() {
+                MatchActivation::Preserve
+            } else if scroll_to_new_match {
+                MatchActivation::SelectAndScroll
+            } else {
+                MatchActivation::SelectWithoutScrolling
+            };
+            self.activate_match(active_match_ix, activation, window, cx);
         } else {
             cx.notify();
         }
@@ -601,7 +640,7 @@ impl ThreadSearchBar {
     fn activate_match(
         &mut self,
         ix: usize,
-        scroll_to_match: bool,
+        activation: MatchActivation,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -615,6 +654,7 @@ impl ThreadSearchBar {
         // simply the painted entity whose id equals the target's.
         let target_entity_id = target.entity_id();
         let target_match_ix = target.match_ix();
+        let scroll_to_match = matches!(activation, MatchActivation::SelectAndScroll);
 
         for weak in &self.highlighted_markdowns {
             if let Some(markdown) = weak.upgrade() {
@@ -665,7 +705,7 @@ impl ThreadSearchBar {
             });
         }
 
-        if scroll_to_match
+        if !matches!(activation, MatchActivation::Preserve)
             && let MatchTarget::Editor {
                 editor,
                 anchor_range,
@@ -675,8 +715,13 @@ impl ThreadSearchBar {
         {
             let anchor_range = anchor_range.clone();
             editor.update(cx, |editor, cx| {
+                let selection_effects = if scroll_to_match {
+                    SelectionEffects::scroll(Autoscroll::fit())
+                } else {
+                    SelectionEffects::no_scroll()
+                };
                 editor.change_selections(
-                    SelectionEffects::scroll(Autoscroll::fit()).from_search(true),
+                    selection_effects.from_search(true),
                     window,
                     cx,
                     |selections| selections.select_anchor_ranges([anchor_range]),
@@ -704,7 +749,7 @@ impl ThreadSearchBar {
             Some(ix) => (ix + 1) % self.matches.len(),
             None => 0,
         };
-        self.activate_match(next, true, window, cx);
+        self.activate_match(next, MatchActivation::SelectAndScroll, window, cx);
     }
 
     pub(super) fn select_prev_match(
@@ -726,7 +771,7 @@ impl ThreadSearchBar {
             }
             None => self.matches.len() - 1,
         };
-        self.activate_match(prev, true, window, cx);
+        self.activate_match(prev, MatchActivation::SelectAndScroll, window, cx);
     }
 
     fn dismiss(&mut self, _: &DismissThreadSearch, _window: &mut Window, cx: &mut Context<Self>) {
