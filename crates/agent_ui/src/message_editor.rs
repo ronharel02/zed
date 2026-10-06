@@ -5553,6 +5553,40 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_source_message_invalid_resources_remain_visible(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (message_editor, cx) = setup_message_editor(cx).await;
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_source_message(
+                vec![
+                    acp_v2::ContentBlock::ResourceLink(acp_v2::ResourceLink::new(
+                        "notes.md",
+                        "not a valid uri",
+                    )),
+                    acp_v2::ContentBlock::Text(acp_v2::TextContent::new(" ")),
+                    acp_v2::ContentBlock::Resource(acp_v2::EmbeddedResource::new(
+                        acp_v2::EmbeddedResourceResource::TextResourceContents(
+                            acp_v2::TextResourceContents::new("contents", "also not a valid uri"),
+                        ),
+                    )),
+                    acp_v2::ContentBlock::Text(acp_v2::TextContent::new(" ")),
+                    acp_v2::ContentBlock::Image(
+                        acp_v2::ImageContent::new("ignored", "image/png").uri("invalid image uri"),
+                    ),
+                ],
+                window,
+                cx,
+            );
+        });
+
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "@notes.md also not a valid uri invalid image uri",
+        );
+    }
+
+    #[gpui::test]
     async fn test_source_message_known_text_remains_editable(cx: &mut TestAppContext) {
         init_test(cx);
         let (message_editor, cx) = setup_message_editor(cx).await;
