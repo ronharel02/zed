@@ -91,6 +91,26 @@ In long conversations, use the scroll arrow buttons at the bottom of the panel t
 
 When focus is in the message editor, you can also use {#kb agent::ScrollOutputPageUp}, {#kb agent::ScrollOutputPageDown}, {#kb agent::ScrollOutputToTop}, {#kb agent::ScrollOutputToBottom}, {#kb agent::ScrollOutputLineUp}, and {#kb agent::ScrollOutputLineDown} to navigate the thread, or {#kb agent::ScrollOutputToPreviousMessage} and {#kb agent::ScrollOutputToNextMessage} to jump between your prompts.
 
+### Sticky User Messages {#sticky-user-messages}
+
+Sticky user messages are off by default. To enable them, open the Settings Editor,
+go to **AI**, and turn on **Sticky User Messages**.
+
+As you scroll through long responses and tool calls, the prompt they belong to
+pins to the top of the Agent Panel once it scrolls out of view. The header shows a
+single-line preview, including mentions and images. The next prompt pushes the
+header out and takes its place. Click the header to jump back to the full message.
+
+Or add this to your settings.json:
+
+```json [settings]
+{
+  "agent": {
+    "sticky_user_messages": true
+  }
+}
+```
+
 ### Thread titles {#thread-titles}
 
 Thread titles are auto-generated based on the content of the conversation.
