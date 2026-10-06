@@ -139,6 +139,7 @@ impl UserMessageContent {
                     ..
                 }) => {
                     let Some(uri) = MentionUri::parse(&resource.uri, path_style).log_err() else {
+                        append_text(&mut text, resource.uri);
                         continue;
                     };
                     append_mention(
@@ -153,6 +154,7 @@ impl UserMessageContent {
                 }
                 acp::ContentBlock::ResourceLink(resource) => {
                     let Some(uri) = MentionUri::parse(&resource.uri, path_style).log_err() else {
+                        append_text(&mut text, format!("@{}", resource.name));
                         continue;
                     };
                     append_mention(&mut text, &mut mentions, uri, Mention::Link);
@@ -163,14 +165,17 @@ impl UserMessageContent {
                     mime_type,
                     ..
                 }) => {
-                    let uri = if let Some(uri) = uri {
-                        MentionUri::parse(&uri, path_style)
+                    let mention_uri = if let Some(uri) = uri.as_deref() {
+                        MentionUri::parse(uri, path_style)
                     } else {
                         Ok(MentionUri::PastedImage {
                             name: "Image".to_string(),
                         })
                     };
-                    let Some(uri) = uri.log_err() else {
+                    let Some(uri) = mention_uri.log_err() else {
+                        if let Some(uri) = uri {
+                            append_text(&mut text, uri);
+                        }
                         continue;
                     };
                     let Some(format) = ImageFormat::from_mime_type(&mime_type.0) else {
@@ -459,28 +464,56 @@ mod tests {
     }
 
     #[test]
-    fn invalid_resources_are_omitted_like_the_message_editor() {
+    fn invalid_resource_links_fall_back_to_normalized_labels() {
         let content = UserMessageContent::from_blocks(
-            vec![
-                acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
-                    "notes.md",
-                    "not a valid uri",
-                )),
-                acp::ContentBlock::Resource(acp::EmbeddedResource::new(
-                    acp::EmbeddedResourceResource::TextResourceContents(
-                        acp::TextResourceContents::new("contents", "also not a valid uri"),
-                    ),
-                )),
-            ],
+            vec![acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                "notes.md\r\nMore context",
+                "not a valid uri",
+            ))],
             PathStyle::Unix,
         );
 
-        assert!(content.text.is_empty());
+        assert_eq!(content.text.as_ref(), "@notes.md\nMore context");
         assert!(content.mentions.is_empty());
         let line = content.first_line();
         assert_eq!(line.segments.len(), 1);
-        assert_eq!(line.segments[0].display_text(), "Message");
-        assert_eq!(line.segments[0].source_range, None);
+        assert_eq!(line.segments[0].display_text(), "@notes.md");
+        assert_eq!(line.segments[0].source_range, Some(0..9));
+        assert!(line.has_more_content);
+    }
+
+    #[test]
+    fn invalid_embedded_resources_fall_back_to_the_uri() {
+        let content = UserMessageContent::from_blocks(
+            vec![acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                acp::EmbeddedResourceResource::TextResourceContents(
+                    acp::TextResourceContents::new("contents", "not a valid uri"),
+                ),
+            ))],
+            PathStyle::Unix,
+        );
+
+        assert_eq!(content.text.as_ref(), "not a valid uri");
+        assert!(content.mentions.is_empty());
+        let line = content.first_line();
+        assert_eq!(line.segments[0].display_text(), "not a valid uri");
+        assert_eq!(line.segments[0].source_range, Some(0..15));
+    }
+
+    #[test]
+    fn invalid_image_uris_fall_back_to_text() {
+        let content = UserMessageContent::from_blocks(
+            vec![acp::ContentBlock::Image(
+                acp::ImageContent::new("ignored", "image/png").uri("not a valid uri"),
+            )],
+            PathStyle::Unix,
+        );
+
+        assert_eq!(content.text.as_ref(), "not a valid uri");
+        assert!(content.mentions.is_empty());
+        let line = content.first_line();
+        assert_eq!(line.segments[0].display_text(), "not a valid uri");
+        assert_eq!(line.segments[0].source_range, Some(0..15));
     }
 
     #[test]
